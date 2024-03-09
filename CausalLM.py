@@ -1,7 +1,7 @@
 import aka.nn as nn
 import aka.numpy as np
 
-def RMSNorm(dim: int, eps: float = 1e-6):
+def RMSNorm(dim: int, eps: float = 1e-5):
     '''
     Reference: LLaMA and Gemma
     '''
@@ -13,108 +13,7 @@ def RMSNorm(dim: int, eps: float = 1e-6):
         eps = eps,
         weight = nn.Parameter(np.ones(dim)))
 
-def Attention(args):
-    '''
-    Group-Query Attention
-
-    Args:
-        args.latent_dim 
-        args.attn_hidden_dim(Optional, default: latent_dim)
-        args.attn_cache_kv True/False
-
-    Examples:
-        default ==> Attention
-        args.attn_heads = 8 ==> MHA: Multi-Head Attention
-        args.attn_kv_groups = 1 ==> MQA: Multi-Query Attention
-        args.attn_kv_groups = 2 ==> GQA: Group-Query Attention
-    '''
-    def apply_rotary_emb(x, freqs_cis):
-        '''
-        Reference: LLaMA and Gemma
-        Applies the rotary embedding to the query and key tensors.
-        '''
-        B,L,N,D = x.shape
-        y = np.reshape(x, (B,L,N,2,D//2)).float()
-        y = np.einsum('blncd->bnldc',y)
-        y = np.view_as_complex(y.contiguous())
-        y = np.view_as_real(y*freqs_cis).type_as(x)
-        y = np.einsum('bnldc->blncd', y)
-        return np.reshape(y, (B,L,N,D))
-
-    def forward(self, x, *, freqs_cis=None):
-        B, L, _ = x.size()
-
-        # -- qkv --
-        attn_hidden_dim, attn_heads, attn_kv_groups = self.attn_hidden_dim, self.attn_heads, self.attn_kv_groups
-        attn_head_dim = attn_hidden_dim // attn_heads
-        attn_kv_dim = attn_head_dim * attn_kv_groups
-        q, k, v  = self.c_attn(x).split([attn_hidden_dim,attn_kv_dim,attn_kv_dim], dim=2)
-        q = q.view(B, L, attn_heads, attn_head_dim)
-        k = k.view(B, L, attn_kv_groups, attn_head_dim)
-        v = v.view(B, L, attn_kv_groups, attn_head_dim)
-
-        # -- append cache(history) --
-        if(self.attn_cache_kv):
-            k, v = self.cache_kv(k, v)
-
-        # -- rotary embedding --
-        if freqs_cis is not None:
-            M = k.size(1)
-            q = apply_rotary_emb(q, freqs_cis=freqs_cis[M-L:M,:])
-            k = apply_rotary_emb(k, freqs_cis=freqs_cis[:M,:])
-
-        # -- repeat kv to q --
-        if attn_kv_groups != attn_heads:
-            # [B, L, N, head_dim]
-            k = np.repeat(k, attn_heads // attn_kv_groups, dim=2)
-            v = np.repeat(v, attn_heads // attn_kv_groups, dim=2)
-
-        # -- attn --
-        att = np.einsum('blnd,bmnd->bnlm', q, k) * self.scale_dk
-        att = att.masked_fill(self.bias[:,:,M-L:M,:M]==0, float('-inf'))
-        att = np.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = np.einsum('bnlm,bmnd->blnd', att, v)
-        y = y.reshape(B, L, attn_hidden_dim) # re-assemble all head outputs side by side
-        return self.resid_dropout(self.c_proj(y))
-
-    def cache_kv(self, k, v):
-        if not hasattr(self,'kv_cache'):
-            self.kv_cache = (k, v)
-        else:
-            k_cache, v_cache = self.kv_cache
-            B, L, N, D = k.shape
-            if B == k_cache.size(0):
-                k = np.cat((k_cache.detach()[:,L-self.block_size:,:], k), dim=1)
-                v = np.cat((v_cache.detach()[:,L-self.block_size:,:], v), dim=1)
-            self.kv_cache = (k, v)
-        return k,v
-    
-    attn_hidden_dim = getattr(args, 'attn_hidden_dim', args.latent_dim)
-    attn_heads = getattr(args, 'attn_heads', 1)
-    attn_kv_groups = getattr(args, 'attn_kv_groups', attn_heads)
-    bias = getattr(args, 'bias', False)
-    dropout = getattr(args, 'dropout', 0.2)
-    attn_head_dim = attn_hidden_dim//attn_heads
-    assert attn_head_dim * attn_heads == attn_hidden_dim
-    assert attn_heads % attn_kv_groups == 0
-    return nn.Module( 
-        forward = forward, 
-        cache_kv = cache_kv,
-        c_attn = nn.Linear(args.latent_dim, attn_head_dim * (attn_heads + attn_kv_groups * 2), bias=bias),
-        c_proj = nn.Linear(attn_hidden_dim, args.latent_dim, bias=bias),
-        attn_dropout = nn.Dropout(dropout),
-        resid_dropout = nn.Dropout(dropout),
-        attn_hidden_dim = attn_hidden_dim,
-        attn_heads = attn_heads,
-        attn_kv_groups = attn_kv_groups,
-        attn_cache_kv = getattr(args,'attn_cache_kv', False),
-        block_size = args.block_size,
-        scale_dk = 1.0/np.sqrt(np.array([attn_head_dim])),
-        bias = np.tril(np.ones(1,1,args.block_size, args.block_size))
-    )
-
-def MLP(args):
+def MLPBlock(args):
     '''
     Reference: Gemma, LLaMA
     Examples:
@@ -130,8 +29,9 @@ def MLP(args):
             up = np.gelu(up)
         return self.down_proj(up)
 
-    mlp_hidden_dim = getattr(args, 'mlp_hidden_dim', args.latent_dim)
-    gate = getattr(args, 'mlp_gate', False)
+    mlp_args = args.mlp_args
+    mlp_hidden_dim = getattr(mlp_args, 'mlp_hidden_dim', args.latent_dim)
+    gate = getattr(mlp_args, 'mlp_gate', False)
     bias = getattr(args,'bias', False)
     return nn.Module(
         forward = forward,
@@ -139,48 +39,29 @@ def MLP(args):
         up_proj = nn.Linear(args.latent_dim, mlp_hidden_dim, bias=bias),
         down_proj = nn.Linear(mlp_hidden_dim, args.latent_dim, bias=bias))
 
-def MHMLP(args):
-    '''
-    Multi-Head MLP
-    '''
-    def forward(self, inputs, **kwargs):
-        B, L, D = inputs.shape
-        x = np.einsum('bld,dnh->blnh', x, self.q_proj)
-        x = np.gelu(x)
-        x = np.einsum('blnd,dnh->blnh', x, self.up_proj)
-        x = np.gelu(x)
-        x = np.einsum('blnh,hnd->blnd', x, self.down_proj)
-        return x.reshape(inputs.shape)
-
-    head_latent_dim = args.latent_dim // args.mlp_heads
-    assert head_latent_dim * args.mlp_heads == args.latent_dim
-    return nn.Module(
-        forward = forward,
-        q_proj = nn.Parameter(shape=(args.latent_dim, args.mlp_heads, head_latent_dim), requires_grad=True, initializer="xavier_uniform"),
-        up_proj = nn.Parameter(shape=(head_latent_dim, args.mlp_heads, args.mlp_hidden_dim), requires_grad=True, initializer="xavier_uniform"),
-        down_proj = nn.Parameter(shape=(args.mlp_hidden_dim, args.mlp_heads, head_latent_dim), requires_grad=True, initializer="xavier_uniform"))
-
 def MetaLayer(name, args):
     '''
     Build resident meta layer by name. Include: GQA(Group-Query Attention), MLP, GateMLP, ...
     '''
     def forward(self, x, **kwargs):
-        x = self.normalize(x)
-        return self.layer(x, **kwargs)
+        y = self.norm(x)
+        return x + self.layer(y, **kwargs)
 
     match name:
         case 'Attention':
-            m = Attention(args)
+            from Attention import AttentionBlock
+            m = AttentionBlock(args)
         case 'MLP':
-            m = MLP(args)
-        case 'MHMLP':
-            m = MHMLP(args)
+            m = MLPBlock(args)
+        case 'Mamba':
+            from Mamba import MambaBlock
+            m = MambaBlock(args)
         case _:
             assert False, f"Unknown layer:{name}"
 
     return nn.Module(
         forward = forward,
-        normalize = RMSNorm(args.latent_dim),
+        norm = RMSNorm(args.latent_dim),
         layer = m
     )
 
@@ -188,7 +69,7 @@ def CausalLM(args):
     '''
     Causal Language Model.
     '''
-    def forward(self, inputs, targets=None):
+    def forward(self, inputs, targets=None, state=None):
         _, L = inputs.shape
         assert L-1 <= self.block_size, f"Input size:{L} too large. Max size: {self.block_size-1}"
 
@@ -205,8 +86,20 @@ def CausalLM(args):
             x = x * (x.size(-1)**0.5)   # -- Gemma, Why? --
         if self.pe is not None:
             x = x + pe
-        for l in self.layers:
-            x = x + l(x, freqs_cis=self.freqs_cis)
+        freqs_cls = self.freqs_cis
+        enable_cache = self.enable_cache
+
+        if(state is not None):
+            if('layer_states' in state):
+                layer_states = state['layer_states']
+            else:
+                layer_states = [{} for _ in self.layers]
+                state['layer_states'] = layer_states
+            for i in range(len(self.layers)):
+                x = self.layers[i](x, freqs_cis=freqs_cls, state=layer_states[i])
+        else:
+            for l in self.layers:
+                x = l(x, freqs_cis=freqs_cls)
         x = self.post_norm(x)
 
         # -- outputs and loss, why not use self.embedding? --
@@ -217,20 +110,37 @@ def CausalLM(args):
             loss = np.cross_entropy(y.view(-1, y.size(-1)), t.reshape(-1), ignore_index=-1)
             return y, loss
         else:
-            return np.argmax(y[:,-1:,:], dim=-1)
+            return y
 
     def generate(self, prompts : str, max_length : int = 1024):
-        prompt_tokens = [self.tokenizer.bos_id()]+self.tokenizer.encode(prompts)
+        prompt_tokens = [self.tokenizer.bos_token_id]+self.tokenizer.encode(prompts)
         print('prompt_tokens', len(prompt_tokens))
-        for i in range(len(prompt_tokens)):
-            output_token_ids = self(np.array([[prompt_tokens[i]]]))
+        if hasattr(self, 'eval'):
+            self.eval()
 
-        response_token_ids = output_token_ids
-        for _ in range(max_length):
-            output_token_ids = self(output_token_ids)
-            response_token_ids = np.cat((response_token_ids, output_token_ids), dim=1)
-            if self.tokenizer.eos_id() in output_token_ids:
-                break
+        with np.no_grad():
+            if self.enable_cache:
+                state = {}
+                for i in range(len(prompt_tokens)):
+                    outputs = self(np.array([[prompt_tokens[i]]]), state=state)
+                    output_token_ids = np.argmax(outputs[:,-1:,:], dim=-1)
+
+                response_token_ids = output_token_ids
+                for _ in range(max_length):
+                    outputs = self(output_token_ids, state=state)
+                    output_token_ids = np.argmax(outputs[:,-1:,:], dim=-1)
+                    response_token_ids = np.cat((response_token_ids, output_token_ids), dim=1)
+                    if self.tokenizer.eos_token_id in output_token_ids:
+                        break
+            else:
+                input_token_ids = np.array([prompt_tokens])
+                for _ in range(max_length):
+                    outputs = self(input_token_ids)
+                    output_token_ids = np.argmax(outputs[:,-1:,:], dim=-1)
+                    input_token_ids = np.cat((input_token_ids, output_token_ids), dim=1)
+                    if self.tokenizer.eos_token_id in output_token_ids:
+                        break
+                response_token_ids = input_token_ids[:,len(prompt_tokens):]
 
         response_tokens = response_token_ids.squeeze(0).tolist()
         return self.tokenizer.decode(response_tokens)
@@ -250,8 +160,8 @@ def CausalLM(args):
     if getattr(args, 'rotary_embedding', False):
         # Pre-compute rotary embedding table.
         rope_theta = getattr(args, 'rope_theta', 10000)
-        attn_hidden_dim = getattr(args, 'attn_hidden_dim', args.latent_dim)
-        attn_heads = getattr(args, 'attn_heads', 1)
+        attn_hidden_dim = getattr(args.attn_args, 'attn_hidden_dim', args.latent_dim)
+        attn_heads = getattr(args.attn_args, 'attn_heads', 1)
         freqs_cis = precompute_freqs_cis(
                             attn_hidden_dim//attn_heads,
                             args.block_size,
@@ -273,5 +183,6 @@ def CausalLM(args):
         prev_norm = getattr(args, 'prev_norm', False),
         # output = nn.Linear(args.latent_dim, args.vocab_size, bias=args.bias), # LLaMA
         pe = pe,
+        enable_cache = getattr(args, 'enable_cache', False),
         freqs_cis = freqs_cis
     )
