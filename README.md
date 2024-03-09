@@ -2,7 +2,7 @@
 
 A simple gemma demo. This repo is just for learning and backup. The codes in this Gemma is only < 400 lines. I just run it on laptop CPU(no CUDA).
 
-If we limit the block_size to smaller value( even 256 ), it still work well. This feature looks like a Griffin implementation? :)
+If we limit the block_size to smaller value( even 256 ), it still work well. 
 
 Please forget all aka code here. It's a sample proxy to torch:
 
